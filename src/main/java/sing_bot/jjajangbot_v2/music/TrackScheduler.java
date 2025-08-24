@@ -2,77 +2,66 @@ package sing_bot.jjajangbot_v2.music;
 
 import com.sedmelluq.discord.lavaplayer.player.AudioPlayer;
 import com.sedmelluq.discord.lavaplayer.player.event.AudioEventAdapter;
-import com.sedmelluq.discord.lavaplayer.tools.FriendlyException;
 import com.sedmelluq.discord.lavaplayer.track.AudioTrack;
+import com.sedmelluq.discord.lavaplayer.track.AudioTrackEndReason;
+import net.dv8tion.jda.api.entities.Guild;
+import sing_bot.jjajangbot_v2.ui.PlayerUI;
 
-import java.net.ConnectException;
-import java.net.SocketTimeoutException;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
 
 public class TrackScheduler extends AudioEventAdapter {
     private final AudioPlayer player;
+    private final BlockingQueue<AudioTrack> queue = new LinkedBlockingQueue<>();
+    private final Guild guild;
+    private volatile boolean loop = false;
+    private volatile AudioTrack lastTrack = null;
 
-    /** 패널/큐 표시용 공개 큐 */
-    public final BlockingQueue<AudioTrack> queue = new LinkedBlockingQueue<>();
-
-    /** 타임아웃류 실패 시 1회 재시도 플래그 */
-    private volatile boolean retriedOnce = false;
-
-    public TrackScheduler(AudioPlayer player) {
+    public TrackScheduler(AudioPlayer player, Guild guild) {
         this.player = player;
+        this.guild = guild;
+    }
+
+    public void setLoop(boolean loop) {
+        this.loop = loop;
     }
 
     public void queue(AudioTrack track) {
         if (!player.startTrack(track, true)) {
             queue.offer(track);
         }
+        PlayerUI.updateNowPlaying(guild, player, queue);
     }
 
     public void nextTrack() {
-        retriedOnce = false;
-        player.startTrack(queue.poll(), false);
+        AudioTrack next = queue.poll();
+        if (next != null) {
+            player.startTrack(next, false);
+        } else {
+            player.stopTrack();
+        }
+        PlayerUI.updateNowPlaying(guild, player, queue);
     }
 
     @Override
     public void onTrackStart(AudioPlayer player, AudioTrack track) {
-        retriedOnce = false;
+        lastTrack = track;
+        PlayerUI.updateNowPlaying(guild, player, queue);
     }
 
     @Override
-    public void onTrackEnd(
-            AudioPlayer player,
-            AudioTrack track,
-            com.sedmelluq.discord.lavaplayer.track.AudioTrackEndReason endReason
-    ) {
-        if (endReason == com.sedmelluq.discord.lavaplayer.track.AudioTrackEndReason.FINISHED
-                || endReason == com.sedmelluq.discord.lavaplayer.track.AudioTrackEndReason.LOAD_FAILED) {
-            nextTrack();
+    public void onTrackEnd(AudioPlayer player, AudioTrack track, AudioTrackEndReason endReason) {
+        if (endReason.mayStartNext) {
+            if (loop && lastTrack != null) {
+                player.startTrack(lastTrack.makeClone(), false);
+            } else {
+                nextTrack();
+            }
         }
+        PlayerUI.updateNowPlaying(guild, player, queue);
     }
 
-
-    @Override
-    public void onTrackException(AudioPlayer player, AudioTrack track, FriendlyException exception) {
-        // 네트워크 타임아웃/연결 계열은 1회 재시도
-        if (!retriedOnce && isTimeoutLike(exception)) {
-            retriedOnce = true;
-            player.startTrack(track.makeClone(), false);
-            return;
-        }
-        nextTrack();
-    }
-
-    @Override
-    public void onTrackStuck(AudioPlayer player, AudioTrack track, long thresholdMs) {
-        nextTrack();
-    }
-
-    private boolean isTimeoutLike(Throwable t) {
-        while (t != null) {
-            if (t instanceof SocketTimeoutException || t instanceof ConnectException) return true;
-            t = t.getCause();
-        }
-        return false;
+    public BlockingQueue<AudioTrack> getQueue() {
+        return queue;
     }
 }

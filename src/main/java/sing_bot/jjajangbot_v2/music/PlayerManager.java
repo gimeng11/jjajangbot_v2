@@ -1,66 +1,56 @@
 package sing_bot.jjajangbot_v2.music;
 
-import com.sedmelluq.discord.lavaplayer.player.AudioLoadResultHandler;
-import com.sedmelluq.discord.lavaplayer.player.AudioPlayerManager;
-import com.sedmelluq.discord.lavaplayer.player.DefaultAudioPlayerManager;
+import com.sedmelluq.discord.lavaplayer.player.*;
 import com.sedmelluq.discord.lavaplayer.tools.FriendlyException;
-import com.sedmelluq.discord.lavaplayer.track.AudioPlaylist;
-import com.sedmelluq.discord.lavaplayer.track.AudioTrack;
+import com.sedmelluq.discord.lavaplayer.track.*;
 import dev.lavalink.youtube.YoutubeAudioSourceManager;
 import net.dv8tion.jda.api.entities.Guild;
+import net.dv8tion.jda.api.entities.channel.concrete.TextChannel;
+import org.springframework.stereotype.Component;
 
-import java.util.ArrayList;
-import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.function.Consumer;
+import java.util.concurrent.TimeUnit;
+import java.util.regex.Pattern;
 
-/**
- * Lavaplayer 수명/소스 등록 + 길드별 매니저 관리
- */
+@Component
 public class PlayerManager {
 
-    private static final PlayerManager INSTANCE = new PlayerManager();
+    private final AudioPlayerManager audioPlayerManager;
+    private final Map<Long, GuildMusicManager> musicManagers;
+    private static final Pattern URL_PATTERN =
+            Pattern.compile("^(https?://|www\\.)\\S+$", Pattern.CASE_INSENSITIVE);
 
-    public static PlayerManager getInstance() {
-        return INSTANCE;
+    public PlayerManager() {
+        this.audioPlayerManager = new DefaultAudioPlayerManager();
+
+        // YouTube v2 소스 등록 (연령/로그인 제한 이슈 대응)
+        this.audioPlayerManager.registerSourceManager(new YoutubeAudioSourceManager(true));
+
+        this.musicManagers = new ConcurrentHashMap<>();
     }
 
-    private final AudioPlayerManager playerManager;
-    private final Map<Long, GuildMusicManager> musicManagers = new ConcurrentHashMap<>();
-
-    private PlayerManager() {
-        this.playerManager = new DefaultAudioPlayerManager();
-
-        // ✅ 유튜브 소스 등록 (dev.lavalink.youtube v2)
-        YoutubeAudioSourceManager yt = new YoutubeAudioSourceManager();
-        this.playerManager.registerSourceManager(yt);
-
-        // (선택) 필요시 설정 추가 가능
-        // this.playerManager.getConfiguration().setFilterHotSwapEnabled(true);
-    }
-
-    /** 길드별 GuildMusicManager 반환(없으면 생성) */
     public GuildMusicManager getGuildMusicManager(Guild guild) {
-        return musicManagers.computeIfAbsent(guild.getIdLong(), id -> {
-            // 🔧 생성자 시그니처에 맞춰 한 개만 전달
-            GuildMusicManager mm = new GuildMusicManager(playerManager);
-            guild.getAudioManager().setSendingHandler(mm.getSendHandler());
-            return mm;
-        });
+        return musicManagers.computeIfAbsent(guild.getIdLong(),
+                id -> {
+                    GuildMusicManager mm = new GuildMusicManager(audioPlayerManager, guild);
+                    guild.getAudioManager().setSendingHandler(mm.getSendHandler());
+                    return mm;
+                });
     }
 
-    /**
-     * URL 또는 검색식(예: ytsearch:"query") 로드 → 큐 추가
-     */
-    public void loadAndPlay(Guild guild, String identifier, TrackLoadResultHandler cb) {
-        GuildMusicManager mm = getGuildMusicManager(guild);
+    public void loadAndPlay(TextChannel channel, String userInput) {
+        GuildMusicManager musicManager = getGuildMusicManager(channel.getGuild());
 
-        playerManager.loadItemOrdered(mm, identifier, new AudioLoadResultHandler() {
+        final boolean isUrl = URL_PATTERN.matcher(userInput).matches();
+        String identifier = isUrl ? userInput : "ytmsearch:" + userInput; // 우선 YT Music 검색
+
+        audioPlayerManager.loadItemOrdered(musicManager, identifier, new AudioLoadResultHandler() {
             @Override
             public void trackLoaded(AudioTrack track) {
-                mm.scheduler.queue(track);
-                if (cb != null) cb.onLoaded(track);
+                musicManager.scheduler.queue(track);
+                channel.sendMessage("🎶 재생 대기열 추가: " + track.getInfo().title)
+                        .queue(m -> m.delete().queueAfter(10, TimeUnit.SECONDS));
             }
 
             @Override
@@ -70,60 +60,41 @@ public class PlayerManager {
                     first = playlist.getTracks().get(0);
                 }
                 if (first != null) {
-                    mm.scheduler.queue(first);
-                    if (cb != null) cb.onLoaded(first);
+                    musicManager.scheduler.queue(first);
+                    channel.sendMessage("🎶 재생 대기열 추가: " + first.getInfo().title)
+                            .queue(m -> m.delete().queueAfter(10, TimeUnit.SECONDS));
                 } else {
-                    if (cb != null) cb.onNoMatches();
+                    channel.sendMessage("❌ 재생 가능한 트랙이 없어요.")
+                            .queue(m -> m.delete().queueAfter(10, TimeUnit.SECONDS));
                 }
             }
 
             @Override
             public void noMatches() {
-                if (cb != null) cb.onNoMatches();
+                // 일반 youtube 검색 한번 더
+                if (!isUrl && !identifier.startsWith("ytsearch:")) {
+                    audioPlayerManager.loadItemOrdered(musicManager, "ytsearch:" + userInput, this);
+                    return;
+                }
+                channel.sendMessage("❌ 결과가 없어요.")
+                        .queue(m -> m.delete().queueAfter(10, TimeUnit.SECONDS));
             }
 
             @Override
-            public void loadFailed(FriendlyException exception) {
-                if (cb != null) cb.onFailed(exception);
+            public void loadFailed(FriendlyException ex) {
+                String msg = String.valueOf(ex.getMessage()).toLowerCase();
+
+                if (!isUrl && !identifier.startsWith("ytmsearch:")
+                        && (msg.contains("requires login") || msg.contains("signin") || msg.contains("age"))) {
+                    channel.sendMessage("🔒 로그인/연령 제한 영상 → **YouTube Music**으로 다시 찾는 중…")
+                            .queue(m -> m.delete().queueAfter(10, TimeUnit.SECONDS));
+                    audioPlayerManager.loadItemOrdered(musicManager, "ytmsearch:" + userInput, this);
+                    return;
+                }
+
+                channel.sendMessage("❌ 로드 실패: " + ex.getMessage())
+                        .queue(m -> m.delete().queueAfter(10, TimeUnit.SECONDS));
             }
         });
-    }
-
-    /**
-     * 검색 유틸: ytsearch:"..." 로 상위 N개 결과 반환
-     */
-    public void search(String ytSearchQuery, int limit, Consumer<List<AudioTrack>> onSuccess, Consumer<Throwable> onError) {
-        playerManager.loadItem(ytSearchQuery, new AudioLoadResultHandler() {
-            @Override
-            public void trackLoaded(AudioTrack track) {
-                List<AudioTrack> list = new ArrayList<>();
-                list.add(track);
-                if (onSuccess != null) onSuccess.accept(list);
-            }
-
-            @Override
-            public void playlistLoaded(AudioPlaylist playlist) {
-                List<AudioTrack> tracks = playlist.getTracks();
-                List<AudioTrack> out = tracks.size() > limit ? tracks.subList(0, limit) : new ArrayList<>(tracks);
-                if (onSuccess != null) onSuccess.accept(out);
-            }
-
-            @Override
-            public void noMatches() {
-                if (onSuccess != null) onSuccess.accept(List.of());
-            }
-
-            @Override
-            public void loadFailed(FriendlyException exception) {
-                if (onError != null) onError.accept(exception);
-            }
-        });
-    }
-
-    /** 콜백 인터페이스 (CommandListener에서 사용) */
-    public interface TrackLoadResultHandler {
-        void onLoaded(AudioTrack t);
-        void onNoMatches();
-        void onFailed(Throwable t);
     }
 }

@@ -1,4 +1,3 @@
-
 package sing_bot.jjajangbot_v2;
 
 import org.springframework.boot.SpringApplication;
